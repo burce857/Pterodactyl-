@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; echo; echo "[ERROR] line=$LINENO cmd=$BASH_COMMAND exit=$rc" >&2; exit $rc' ERR
+
+GREEN='\033[1;32m'; YELLOW='\033[1;33m'; RED='\033[1;31m'; CYAN='\033[1;36m'; RESET='\033[0m'
+info(){ echo -e "${CYAN}[INFO]${RESET} $*"; }
+ok(){ echo -e "${GREEN}[OK]${RESET} $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${RESET} $*"; }
+die(){ echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "請用 root 執行：sudo -i"
+source /etc/os-release
+[[ "${ID:-}" == ubuntu ]] || die "只支援 Ubuntu 22.04 / 24.04"
+case "${VERSION_ID:-}" in 22.04|24.04) ;; *) die "不支援 Ubuntu ${VERSION_ID:-unknown}";; esac
+case "$(uname -m)" in x86_64) WINGS_ARCH=amd64; CF_ARCH=amd64;; aarch64|arm64) WINGS_ARCH=arm64; CF_ARCH=arm64;; *) die "不支援 CPU 架構";; esac
+
+prompt_default(){ local v="$1" m="$2" d="$3" x=""; read -r -p "$m [$d]: " x; printf -v "$v" '%s' "${x:-$d}"; }
+prompt_required(){ local v="$1" m="$2" x=""; while [[ -z "$x" ]]; do read -r -p "$m: " x; done; printf -v "$v" '%s' "$x"; }
+prompt_secret(){ local v="$1" m="$2" x=""; while [[ -z "$x" ]]; do read -r -s -p "$m: " x; echo; done; printf -v "$v" '%s' "$x"; }
+confirm(){ local m="$1" d="${2:-N}" a=""; if [[ "$d" == Y ]]; then read -r -p "$m [Y/n]: " a; a="${a:-Y}"; else read -r -p "$m [y/N]: " a; a="${a:-N}"; fi; [[ "$a" =~ ^[Yy]$ ]]; }
+clean_domain(){ local d="$1"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; d="${d%%:*}"; printf '%s' "$d"; }
+valid_pw(){ [[ ${#1} -ge 8 && "$1" =~ [A-Z] && "$1" =~ [a-z] && "$1" =~ [0-9] ]]; }
+
+ask_panel(){
+  clear || true
+  echo "============================================================"
+  echo " Pterodactyl Panel + Cloudflare Tunnel + Wings + FRP"
+  echo "============================================================"
+  echo
+  echo "先問完 Panel 資料；Panel 安裝完成後才會開始問 Node。"
+  echo
+  echo "Cloudflare Dashboard 請先建立 Tunnel，Public Hostname："
+  echo "  你的 Panel 網域 -> HTTP -> localhost:80"
+  echo "然後準備 Tunnel Token。"
+  echo
+  prompt_required PANEL_DOMAIN "Panel 網域，例如 p.example.com"
+  PANEL_DOMAIN="$(clean_domain "$PANEL_DOMAIN")"
+  PANEL_URL="https://${PANEL_DOMAIN}"
+  prompt_default TIMEZONE "時區" "Asia/Taipei"
+  prompt_required PANEL_EMAIL "管理員 Email"
+  prompt_default ADMIN_USER "管理員 Username" "admin"
+  prompt_default ADMIN_FIRST "First name" "Admin"
+  prompt_default ADMIN_LAST "Last name" "User"
+  while true; do prompt_secret ADMIN_PASS "管理員密碼（至少8碼，大小寫+數字）"; valid_pw "$ADMIN_PASS" && break; warn "密碼格式不符合"; done
+  prompt_default DB_NAME "MariaDB Database" "panel"
+  prompt_default DB_USER "MariaDB User" "pterodactyl"
+  read -r -s -p "MariaDB 密碼（Enter 自動產生）: " DB_PASS; echo
+  [[ -n "$DB_PASS" ]] || DB_PASS="$(printf '%s%s%s' "$RANDOM" "$(date +%s%N)" "$RANDOM" | sha256sum | cut -c1-32)"
+  prompt_secret CF_TUNNEL_TOKEN "Cloudflare Tunnel Token"
+  echo
+  echo "Panel URL : $PANEL_URL"
+  echo "Database  : $DB_NAME / $DB_USER"
+  echo "Web       : Cloudflare Tunnel -> localhost:80"
+  confirm "開始安裝 Panel？" Y || exit 0
+}
+
+install_panel_deps(){
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y software-properties-common curl ca-certificates gnupg lsb-release apt-transport-https tar unzip git cron openssl jq python3
+  if [[ "$VERSION_ID" == 22.04 ]]; then LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php; apt-get update -y; fi
+  apt-get install -y php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-fpm php8.3-curl php8.3-zip mariadb-server redis-server nginx
+  systemctl enable --now mariadb redis-server php8.3-fpm nginx cron
+}
+
+install_composer(){
+  if ! command -v composer >/dev/null 2>&1; then
+    curl -fsSL https://getcomposer.org/installer -o /tmp/composer.php
+    php /tmp/composer.php --install-dir=/usr/local/bin --filename=composer
+    rm -f /tmp/composer.php
+  fi
+}
+
+setup_db(){
+  local p="${DB_PASS//\'/\'\'}"
+  mariadb <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${p}';
+ALTER USER '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${p}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+}
+
+set_env(){ python3 - "$1" "$2" <<'PY'
+import sys
+k,v=sys.argv[1:]
+p='/var/www/pterodactyl/.env'
+lines=open(p,encoding='utf-8').read().splitlines()
+out=[]; done=False
+for line in lines:
+    if line.startswith(k+'='):
+        out.append(f'{k}={v}'); done=True
+    else: out.append(line)
+if not done: out.append(f'{k}={v}')
+open(p,'w',encoding='utf-8').write('\n'.join(out)+'\n')
+PY
+}
+
+install_panel_files(){
+  mkdir -p /var/www/pterodactyl
+  if [[ -f /var/www/pterodactyl/artisan || -f /var/www/pterodactyl/.env ]]; then
+    local b="/root/pterodactyl-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    warn "發現舊 Panel，備份：$b"
+    tar -czf "$b" -C /var/www pterodactyl
+    find /var/www/pterodactyl -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  fi
+  cd /var/www/pterodactyl
+  curl -fLo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+  tar -xzf panel.tar.gz && rm -f panel.tar.gz
+  chmod -R 755 storage bootstrap/cache
+  cp .env.example .env
+  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+  php artisan key:generate --force
+  set_env APP_URL "$PANEL_URL"
+  set_env APP_TIMEZONE "$TIMEZONE"
+  set_env APP_SERVICE_AUTHOR "$PANEL_EMAIL"
+  set_env APP_ENV production
+  set_env APP_DEBUG false
+  set_env DB_HOST 127.0.0.1
+  set_env DB_PORT 3306
+  set_env DB_DATABASE "$DB_NAME"
+  set_env DB_USERNAME "$DB_USER"
+  set_env DB_PASSWORD "$DB_PASS"
+  set_env CACHE_STORE redis
+  set_env CACHE_DRIVER redis
+  set_env SESSION_DRIVER database
+  set_env QUEUE_CONNECTION redis
+  set_env REDIS_HOST 127.0.0.1
+  set_env REDIS_PORT 6379
+  set_env TRUSTED_PROXIES 127.0.0.1
+  set_env MAIL_MAILER log
+  php artisan migrate --seed --force
+  php artisan p:user:make --email="$PANEL_EMAIL" --username="$ADMIN_USER" --name-first="$ADMIN_FIRST" --name-last="$ADMIN_LAST" --password="$ADMIN_PASS" --admin=1
+}
+
+setup_nginx(){
+cat >/etc/nginx/sites-available/pterodactyl.conf <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${PANEL_DOMAIN};
+    root /var/www/pterodactyl/public;
+    index index.php;
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+
+    location ~ \.php\$ {
+        fastcgi_split_path_info ^(.+\.php)(/.+)\$;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_param HTTP_X_FORWARDED_PROTO \$http_x_forwarded_proto;
+        fastcgi_param HTTP_X_FORWARDED_FOR \$http_x_forwarded_for;
+        fastcgi_param HTTP_X_FORWARDED_HOST \$http_x_forwarded_host;
+        fastcgi_param HTTP_CF_CONNECTING_IP \$http_cf_connecting_ip;
+        fastcgi_intercept_errors off;
+    }
+    location ~ /\.ht { deny all; }
+}
+NGINX
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sfn /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+  nginx -t
+  systemctl restart nginx
+}
+
+setup_workers(){
+cat >/etc/systemd/system/pteroq.service <<'EOFQ'
+[Unit]
+Description=Pterodactyl Queue Worker
+After=redis-server.service mariadb.service
+[Service]
+User=www-data
+Group=www-data
+Restart=always
+ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOFQ
+cat >/etc/cron.d/pterodactyl <<'EOFC'
+* * * * * www-data /usr/bin/php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1
+EOFC
+  chmod 644 /etc/cron.d/pterodactyl
+  chown -R www-data:www-data /var/www/pterodactyl
+  chmod -R 755 /var/www/pterodactyl/storage /var/www/pterodactyl/bootstrap/cache
+  systemctl daemon-reload
+  systemctl enable --now pteroq nginx mariadb redis-server php8.3-fpm cron
+}
+
+setup_cloudflared(){
+  curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
+  chmod +x /usr/local/bin/cloudflared
+  if systemctl list-unit-files | grep -q '^cloudflared.service'; then
+    systemctl stop cloudflared 2>/dev/null || true
+    /usr/local/bin/cloudflared service uninstall 2>/dev/null || true
+  fi
+  /usr/local/bin/cloudflared service install "$CF_TUNNEL_TOKEN"
+  systemctl enable --now cloudflared
+  sleep 2
+  systemctl is-active --quiet cloudflared || { journalctl -u cloudflared -n 80 --no-pager; die "cloudflared 啟動失敗"; }
+}
+
+install_panel(){
+  ask_panel
+  info "安裝 Panel dependencies..."; install_panel_deps
+  install_composer
+  setup_db
+  install_panel_files
+  setup_nginx
+  setup_workers
+  setup_cloudflared
+  cd /var/www/pterodactyl && php artisan optimize:clear >/dev/null || true
+  ok "Panel 完成：$PANEL_URL"
+  echo "Cloudflare Tunnel Public Hostname 必須是：${PANEL_DOMAIN} -> http://localhost:80"
+}
+
+# ---------------- Node ----------------
+ask_node(){
+  echo
+  echo "============================================================"
+  echo "                  Node / Wings"
+  echo "============================================================"
+  echo "Panel 已經裝完，現在才開始問 Node。"
+  prompt_required NODE_FQDN "Node FQDN，例如 node1.example.com"
+  NODE_FQDN="$(clean_domain "$NODE_FQDN")"
+  prompt_required FRP_PUBLIC_IP "FRP 公網 IPv4"
+  prompt_default WINGS_LOCAL_API "Wings 內部 API Port" "8080"
+  prompt_default WINGS_LOCAL_SFTP "Wings 內部 SFTP Port" "2022"
+  prompt_default FRP_API_PORT "FRP 外部 API Port（Panel 填這個）" "20020"
+  prompt_default FRP_SFTP_PORT "FRP 外部 SFTP Port（Panel 填這個）" "20021"
+  echo "Cloudflare API Token 權限：Zone Read + DNS Edit"
+  prompt_secret CF_API_TOKEN "Cloudflare API Token"
+  echo
+  echo "${NODE_FQDN} -> ${FRP_PUBLIC_IP} (DNS only)"
+  echo "API : ${FRP_API_PORT} -> ${WINGS_LOCAL_API}"
+  echo "SFTP: ${FRP_SFTP_PORT} -> ${WINGS_LOCAL_SFTP}"
+  confirm "開始部署 Node？" Y
+}
+
+install_node_deps(){
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates jq python3 python3-yaml certbot python3-certbot-dns-cloudflare
+  if ! command -v docker >/dev/null 2>&1; then curl -fsSL https://get.docker.com/ | CHANNEL=stable bash; fi
+  systemctl enable --now docker
+  docker info >/dev/null
+}
+
+install_wings(){
+  mkdir -p /etc/pterodactyl /var/lib/pterodactyl/volumes
+  curl -fL -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${WINGS_ARCH}"
+  chmod +x /usr/local/bin/wings
+}
+
+find_zone(){
+  local c="$NODE_FQDN" j z
+  while [[ "$c" == *.* ]]; do
+    j="$(curl -fsS -G https://api.cloudflare.com/client/v4/zones -H "Authorization: Bearer ${CF_API_TOKEN}" -H 'Content-Type: application/json' --data-urlencode "name=${c}")"
+    z="$(jq -r '.result[0].id // empty' <<<"$j")"
+    if [[ -n "$z" ]]; then CF_ZONE_ID="$z"; CF_ZONE_NAME="$c"; return 0; fi
+    c="${c#*.}"
+  done
+  return 1
+}
+
+setup_node_dns(){
+  find_zone || die "找不到 Cloudflare Zone，檢查 Token 的 Zone Read 權限"
+  local old rid payload result
+  old="$(curl -fsS -G "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" -H "Authorization: Bearer ${CF_API_TOKEN}" -H 'Content-Type: application/json' --data-urlencode 'type=A' --data-urlencode "name=${NODE_FQDN}")"
+  rid="$(jq -r '.result[0].id // empty' <<<"$old")"
+  payload="$(jq -nc --arg n "$NODE_FQDN" --arg ip "$FRP_PUBLIC_IP" '{type:"A",name:$n,content:$ip,ttl:1,proxied:false}')"
+  if [[ -n "$rid" ]]; then
+    result="$(curl -fsS -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${rid}" -H "Authorization: Bearer ${CF_API_TOKEN}" -H 'Content-Type: application/json' --data "$payload")"
+  else
+    result="$(curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" -H "Authorization: Bearer ${CF_API_TOKEN}" -H 'Content-Type: application/json' --data "$payload")"
+  fi
+  [[ "$(jq -r '.success' <<<"$result")" == true ]] || { jq . <<<"$result"; die "Cloudflare DNS 建立失敗"; }
+  ok "DNS：${NODE_FQDN} -> ${FRP_PUBLIC_IP} (DNS only)"
+}
+
+issue_cert(){
+  mkdir -p /root/.secrets/certbot
+  cat >/root/.secrets/certbot/cloudflare.ini <<EOFAPI
+dns_cloudflare_api_token = ${CF_API_TOKEN}
+EOFAPI
+  chmod 600 /root/.secrets/certbot/cloudflare.ini
+  certbot certonly --non-interactive --agree-tos --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini --dns-cloudflare-propagation-seconds 30 -m "$PANEL_EMAIL" -d "$NODE_FQDN"
+  NODE_CERT="/etc/letsencrypt/live/${NODE_FQDN}/fullchain.pem"
+  NODE_KEY="/etc/letsencrypt/live/${NODE_FQDN}/privkey.pem"
+  [[ -f "$NODE_CERT" && -f "$NODE_KEY" ]] || die "Node 憑證不存在"
+}
+
+show_node_panel_settings(){
+  echo
+  echo "現在到 Panel 建立 Node："
+  echo "  FQDN                 : $NODE_FQDN"
+  echo "  Communicate Over SSL : Use SSL Connection"
+  echo "  Behind Proxy         : No"
+  echo "  Daemon Port          : $FRP_API_PORT"
+  echo "  Daemon SFTP Port     : $FRP_SFTP_PORT"
+  echo
+  echo "建立後到 Node -> Configuration，複製完整 config.yml。"
+  read -r -p "複製完成後按 Enter..."
+}
+
+capture_config(){
+  local tmp=/tmp/wings-config.yml
+  : >"$tmp"
+  echo "請貼上完整 config.yml，貼完後單獨輸入 __END__ 再 Enter："
+  while IFS= read -r line; do [[ "$line" == '__END__' ]] && break; printf '%s\n' "$line" >>"$tmp"; done
+  [[ -s "$tmp" ]] || die "沒有收到 config.yml"
+  python3 - "$tmp" /etc/pterodactyl/config.yml "$WINGS_LOCAL_API" "$WINGS_LOCAL_SFTP" "$NODE_CERT" "$NODE_KEY" <<'PYCFG'
+import sys,yaml
+src,dst,api,sftp,cert,key=sys.argv[1:]
+cfg=yaml.safe_load(open(src,encoding='utf-8'))
+if not isinstance(cfg,dict): raise SystemExit('config.yml 格式錯誤')
+cfg.setdefault('api',{})
+cfg['api']['host']='0.0.0.0'; cfg['api']['port']=int(api)
+cfg['api'].setdefault('ssl',{})
+cfg['api']['ssl'].update({'enabled':True,'cert':cert,'key':key})
+cfg.setdefault('system',{}); cfg['system'].setdefault('sftp',{})
+cfg['system']['sftp']['bind_port']=int(sftp)
+yaml.safe_dump(cfg,open(dst,'w',encoding='utf-8'),sort_keys=False,default_flow_style=False)
+PYCFG
+  chmod 600 /etc/pterodactyl/config.yml
+  rm -f "$tmp"
+}
+
+setup_wings_service(){
+cat >/etc/systemd/system/wings.service <<'EOFW'
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+[Install]
+WantedBy=multi-user.target
+EOFW
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat >/etc/letsencrypt/renewal-hooks/deploy/restart-wings.sh <<'EOFR'
+#!/usr/bin/env bash
+systemctl restart wings.service
+EOFR
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-wings.sh
+  systemctl daemon-reload
+  systemctl reset-failed wings 2>/dev/null || true
+  systemctl enable --now wings
+  sleep 3
+  systemctl is-active --quiet wings || { journalctl -u wings -n 100 --no-pager; die "Wings 啟動失敗"; }
+}
+
+install_node(){
+  ask_node || return 0
+  install_node_deps
+  install_wings
+  setup_node_dns
+  issue_cert
+  show_node_panel_settings
+  capture_config
+  setup_wings_service
+  echo
+  ok "Wings 已啟動並自啟"
+  ss -lntp | grep -E ":(${WINGS_LOCAL_API}|${WINGS_LOCAL_SFTP})\b" || true
+  echo
+  echo "FRP Panel 建立兩條 TCP："
+  echo "  API : localIP=127.0.0.1 localPort=${WINGS_LOCAL_API} remotePort=${FRP_API_PORT}"
+  echo "  SFTP: localIP=127.0.0.1 localPort=${WINGS_LOCAL_SFTP} remotePort=${FRP_SFTP_PORT}"
+  echo
+  echo "Panel Node 填："
+  echo "  FQDN=$NODE_FQDN"
+  echo "  SSL=Yes"
+  echo "  Behind Proxy=No"
+  echo "  Daemon Port=$FRP_API_PORT"
+  echo "  SFTP Port=$FRP_SFTP_PORT"
+}
+
+show_status(){
+  echo
+  echo "==================== 完成 ===================="
+  echo "Panel: $PANEL_URL"
+  for s in nginx mariadb redis-server php8.3-fpm cron pteroq cloudflared docker wings; do
+    if systemctl list-unit-files "${s}.service" >/dev/null 2>&1; then
+      printf '  %-14s enabled=%-8s active=%s\n' "$s" "$(systemctl is-enabled "$s" 2>/dev/null || true)" "$(systemctl is-active "$s" 2>/dev/null || true)"
+    fi
+  done
+}
+
+main(){
+  ask_panel
+  info "安裝 Panel..."
+  install_panel_deps
+  install_composer
+  setup_db
+  install_panel_files
+  setup_nginx
+  setup_workers
+  setup_cloudflared
+  cd /var/www/pterodactyl && php artisan optimize:clear >/dev/null || true
+  ok "Panel 完成：$PANEL_URL"
+  echo "Cloudflare Tunnel Public Hostname：${PANEL_DOMAIN} -> http://localhost:80"
+  echo
+  if confirm "Panel 完成。現在部署 Wings Node？" Y; then install_node; fi
+  show_status
+}
+main "$@"
